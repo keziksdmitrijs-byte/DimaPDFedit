@@ -1,5 +1,6 @@
 import * as pdfjsLib from './lib/pdf.min.js';
 import { makeEngine, mul, apply } from './engine.js';
+import { initPageTools } from './pagetools.js';
 
 const L = window.PDFLib;
 const { PDFDocument, rgb, degrees } = L;
@@ -102,18 +103,26 @@ async function openFile(file) {
   if (!file) return;
   const buf = new Uint8Array(await file.arrayBuffer());
   if (String.fromCharCode(...buf.subarray(0, 1024)).indexOf('%PDF') < 0) { toast('Это не PDF-файл', true); return; }
-  fileName = file.name || 'document.pdf';
-  undoStack = []; redoStack = [];
+  await openBytes(buf, file.name || 'document.pdf');
+}
+
+async function openBytes(buf, name) {
+  const prevName = fileName;
+  fileName = name;
   setBusy(true);
   try {
     await loadBytes(buf, true);
+    undoStack = []; redoStack = [];
+    $('bUndo').disabled = true; $('bRedo').disabled = true;
     $('empty').style.display = 'none';
     $('fname').textContent = fileName;
     $('bSave').disabled = false;
     $('bPrint').disabled = false;
+    $('bSplit').disabled = false;
     updateHint();
   } catch (e) {
     console.error(e);
+    fileName = prevName;
     toast(e && e.message && /encrypt/i.test(e.message) ? 'PDF защищён (зашифрован). Снимите защиту и откройте снова.' : 'Не удалось открыть PDF: ' + (e.message || e), true, 5000);
   } finally { setBusy(false); }
 }
@@ -751,19 +760,21 @@ viewer.addEventListener('scroll', () => {
   $('pageInfo').textContent = n + ' / ' + views.length;
 }, { passive: true });
 
-async function savePdf() {
-  if (!bytes) return;
-  const name = fileName.replace(/\.pdf$/i, '') + '_edited.pdf';
-  const blob = new Blob([bytes], { type: 'application/pdf' });
+async function saveBlob(name, blob) {
   if (downloads) {
-    try { await downloads.save({ filename: name, data: blob }); toast('Файл сохранён'); }
-    catch (e) { if (e && e.code === 'declined') return; toast('Не удалось сохранить: ' + (e.message || e.code || e), true); }
-    return;
+    try { await downloads.save({ filename: name, data: blob }); toast('Файл сохранён: ' + name); return true; }
+    catch (e) { if (e && e.code === 'declined') return false; toast('Не удалось сохранить: ' + (e.message || e.code || e), true); return false; }
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name;
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  return true;
+}
+async function savePdf() {
+  if (!bytes) return;
+  const name = /_edited\.pdf$/i.test(fileName) ? fileName : fileName.replace(/\.pdf$/i, '') + '_edited.pdf';
+  await saveBlob(name, new Blob([bytes], { type: 'application/pdf' }));
 }
 $('bSave').onclick = savePdf;
 
@@ -824,6 +835,7 @@ $('dlgClose').onclick = () => $('dlg').classList.remove('on');
 $('dlgSave').onclick = () => { $('dlg').classList.remove('on'); savePdf(); };
 
 document.addEventListener('keydown', (e) => {
+  if (pageTools.anyOpen()) return;
   const inField = /^(TEXTAREA|INPUT|SELECT)$/.test(document.activeElement && document.activeElement.tagName);
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p' && bytes) { e.preventDefault(); printDoc(); return; }
   if ((e.ctrlKey || e.metaKey) && !inField) {
@@ -844,9 +856,22 @@ const drop = $('drop');
 ['dragenter', 'dragover'].forEach((ev) => window.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
 ['dragleave', 'drop'].forEach((ev) => window.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
 window.addEventListener('drop', (e) => {
-  const f = [...(e.dataTransfer.files || [])].find((x) => /pdf$/i.test(x.type) || /\.pdf$/i.test(x.name));
-  if (f) openFile(f);
+  const files = [...(e.dataTransfer.files || [])].filter((x) => /pdf$/i.test(x.type) || /\.pdf$/i.test(x.name));
+  if (!files.length) return;
+  if (pageTools.mergeOpen()) { pageTools.addMergeFiles(files); return; }
+  openFile(files[0]);
 });
+
+// ---------- merge / split ----------
+const pageTools = initPageTools({
+  pdfjsLib, PDFDocument,
+  pdfjsOptions: (data) => ({ data, cMapUrl: BASE, cMapPacked: true, standardFontDataUrl: BASE, CMapReaderFactory: CMapFactory, StandardFontDataFactory: StdFontFactory, useWorkerFetch: false, isEvalSupported: false }),
+  current: () => (bytes ? { bytes, name: fileName, pjDoc } : null),
+  openBytes, saveBlob, toast, setBusy,
+  beforeOpen: () => { closeEditor(); clearSelection(); },
+});
+$('bMerge').onclick = () => pageTools.openMerge();
+$('bSplit').onclick = () => pageTools.openSplit();
 
 let rz;
 window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(refreshVisible, 200); });
